@@ -348,6 +348,10 @@ var (
 	EnableGatewayAPIGatewayClassController = env.Register("PILOT_ENABLE_GATEWAY_API_GATEWAYCLASS_CONTROLLER", true,
 		"If this is set to true, istiod will create and manage its default GatewayClasses").Get()
 
+	// TODO(shubham1172): connect this flag to other components
+	EnableGatewayAPIGatewayClassControllerV2 = env.Register("PILOT_ENABLE_GATEWAY_API_GATEWAYCLASS_CONTROLLER_V2", true,
+		"If this is set to true, istiod will create and manage its default GatewayClasses using controller v2").Get()
+
 	ClusterName = env.Register("CLUSTER_ID", "Kubernetes",
 		"Defines the cluster and service registry that this Istiod instance belongs to").Get()
 
