@@ -3,11 +3,15 @@ package gateway
 import (
 	"fmt"
 	"sync"
+	"time"
 
+	"go.uber.org/atomic"
 	"istio.io/istio/pilot/pkg/credentials"
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
+	"istio.io/istio/pilot/pkg/model/kstatus"
 	kubecontroller "istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
+	"istio.io/istio/pilot/pkg/status"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/config/schema/collection"
@@ -22,6 +26,7 @@ import (
 	"istio.io/istio/pkg/util/sets"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	k8sv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -33,8 +38,9 @@ type ControllerV2 struct {
 	// client for accessing Kubernetes
 	client kube.Client
 
-	// Queue manages events on Gateway API resources.
-	queue controllers.Queue
+	queue                  controllers.Queue
+	virtualServiceHandlers []model.EventHandler
+	gatewayHandlers        []model.EventHandler
 
 	// state is our computed Istio resources. Access is guarded by stateMu.
 	// This is updated from Reconcile().
@@ -54,6 +60,11 @@ type ControllerV2 struct {
 	gateways       kclient.Client[*k8sv1.Gateway]
 	httpRoutes     kclient.Client[*k8sv1.HTTPRoute]
 
+	// statusController controls the status working queue. Status will only be written if statusEnabled is true, which
+	// is only the case when we are the leader.
+	statusController *status.Controller
+	statusEnabled    *atomic.Bool
+
 	waitForCRD func(class schema.GroupVersionResource, stop <-chan struct{}) bool
 }
 
@@ -63,6 +74,8 @@ func NewControllerV2(
 	credsController credentials.MulticlusterController,
 	waitForCRD func(class schema.GroupVersionResource, stop <-chan struct{}) bool,
 ) model.ConfigStoreController {
+	var ctl *status.Controller
+
 	namespaces := kclient.New[*corev1.Namespace](kc)
 	gatewayClasses := kclient.New[*k8sv1.GatewayClass](kc)
 	gateways := kclient.NewFiltered[*k8sv1.Gateway](kc, kclient.Filter{ObjectFilter: options.GetFilter()})
@@ -75,11 +88,14 @@ func NewControllerV2(
 		gatewayClasses:        gatewayClasses,
 		gateways:              gateways,
 		httpRoutes:            httpRoutes,
-		waitForCRD:            waitForCRD,
+		statusController:      ctl,
+		// Disabled by default, we will enable only if we win the leader election
+		statusEnabled: atomic.NewBool(false),
+		waitForCRD:    waitForCRD,
 	}
 
 	c.queue = controllers.NewQueue("gateway-api",
-		// controllers.WithReconciler(c.OnEvent),
+		controllers.WithReconciler(c.OnEvent),
 		controllers.WithMaxAttempts(25))
 
 	c.gatewayClasses.AddEventHandler(controllers.ObjectHandler(c.queue.AddObject))
@@ -104,6 +120,63 @@ func NewControllerV2(
 	return c
 }
 
+func (c *ControllerV2) OnEvent(item types.NamespacedName) error {
+	t0 := time.Now()
+	defer func() {
+		logV2.Debugf("reconcile complete in %v", time.Since(t0))
+	}()
+
+	// gatewayClass := c.gatewayClasses.List(metav1.NamespaceAll)
+	// gateway := c.cache.List(gvk.KubernetesGateway, metav1.NamespaceAll)
+	// httpRoute := c.cache.List(gvk.HTTPRoute, metav1.NamespaceAll)
+
+	event := model.EventUpdate
+
+	output := convertResources(input)
+
+	// Handle all status updates
+	c.queueStatusUpdates(input)
+
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	c.state = output
+	return nil
+}
+
+func (c *ControllerV2) queueStatusUpdates(r GatewayResources) {
+	c.handleStatusUpdates(r.GatewayClass)
+	c.handleStatusUpdates(r.Gateway)
+	c.handleStatusUpdates(r.HTTPRoute)
+	// TODO: Add more Gateway API resources.
+	// c.handleStatusUpdates(r.GRPCRoute)
+	// c.handleStatusUpdates(r.TCPRoute)
+	// c.handleStatusUpdates(r.TLSRoute)
+}
+
+func (c *ControllerV2) handleStatusUpdates(configs []config.Config) {
+	if c.statusController == nil || !c.statusEnabled.Load() {
+		return
+	}
+	for _, cfg := range configs {
+		ws := cfg.Status.(*kstatus.WrappedStatus)
+		if ws.Dirty {
+			res := status.ResourceFromModelConfig(cfg)
+			c.statusController.EnqueueStatusUpdateResource(ws.Unwrap(), res)
+		}
+	}
+}
+
+func (c *ControllerV2) SetStatusWrite(enabled bool, statusManager *status.Manager) {
+	c.statusEnabled.Store(enabled)
+	if enabled && features.EnableGatewayAPIGatewayClassControllerV2 && statusManager != nil {
+		c.statusController = statusManager.CreateGenericController(func(status any, context any) status.GenerationProvider {
+			return &gatewayGeneration{context}
+		})
+	} else {
+		c.statusController = nil
+	}
+}
+
 func (c *ControllerV2) List(typ config.GroupVersionKind, namespace string) []config.Config {
 	if typ != gvk.Gateway && typ != gvk.VirtualService {
 		return nil
@@ -122,8 +195,17 @@ func (c *ControllerV2) List(typ config.GroupVersionKind, namespace string) []con
 }
 
 // RegisterEventHandler implements model.ConfigStoreController.
-func (*ControllerV2) RegisterEventHandler(kind config.GroupVersionKind, handler func(config.Config, config.Config, model.Event)) {
-	panic("unimplemented")
+func (c *ControllerV2) RegisterEventHandler(kind config.GroupVersionKind, f model.EventHandler) {
+	switch kind {
+	case gvk.Namespace:
+		c.namespaceHandler = f
+	case gvk.Secret:
+		c.secretHandler = f
+	case gvk.Gateway:
+		c.gatewayHandlers = append(c.gatewayHandlers, f)
+	case gvk.VirtualService:
+		c.virtualServiceHandlers = append(c.virtualServiceHandlers, f)
+	}
 }
 
 func (c *ControllerV2) Run(stop <-chan struct{}) {

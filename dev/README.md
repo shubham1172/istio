@@ -1,3 +1,15 @@
+# Gateway Controller V2
+
+## Overview
+
+![image](./architecture.png)
+
+## Brief
+
+Gateway Controller V2 is replacement for Gateway Controller V1.
+
+## Development
+
 Installed Istio like this.
 
 ```bash
