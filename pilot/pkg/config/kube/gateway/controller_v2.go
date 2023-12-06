@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"sync"
 
-	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	kubecontroller "istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
 	"istio.io/istio/pkg/config"
@@ -20,7 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	k8sv1 "sigs.k8s.io/gateway-api/apis/v1"
+	k8sv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 var logV2 = istiolog.RegisterScope("gateway_v2", "gateway-api controller v2")
@@ -37,7 +36,7 @@ type ControllerV2 struct {
 
 	// Processed Gateways
 	gatewaysMMu sync.RWMutex
-	gatewaysM   map[types.NamespacedName]*k8sv1.Gateway
+	gatewaysM   map[types.NamespacedName]*k8sv1beta1.Gateway
 
 	// TODO: these are not used yet, but will be needed.
 	// // Gateway API types reference namespaces directly
@@ -49,9 +48,9 @@ type ControllerV2 struct {
 	// secretHandler         model.EventHandler
 
 	// TODO: Add more Gateway API resources.
-	gatewayClasses kclient.Client[*k8sv1.GatewayClass]
-	gateways       kclient.Client[*k8sv1.Gateway]
-	httpRoutes     kclient.Client[*k8sv1.HTTPRoute]
+	gatewayClasses kclient.Client[*k8sv1beta1.GatewayClass]
+	gateways       kclient.Client[*k8sv1beta1.Gateway]
+	httpRoutes     kclient.Client[*k8sv1beta1.HTTPRoute]
 
 	// TODO: enable status reporting
 	// // statusController controls the status working queue. Status will only be written if statusEnabled is true, which
@@ -67,13 +66,15 @@ func NewControllerV2(
 	options kubecontroller.Options,
 	waitForCRD func(class schema.GroupVersionResource, stop <-chan struct{}) bool,
 ) model.ConfigStoreController {
-	gatewayClasses := kclient.New[*k8sv1.GatewayClass](kc)
-	gateways := kclient.NewFiltered[*k8sv1.Gateway](kc, kclient.Filter{ObjectFilter: options.GetFilter()})
-	httpRoutes := kclient.NewFiltered[*k8sv1.HTTPRoute](kc, kclient.Filter{ObjectFilter: options.GetFilter()})
+	logV2.Warnf("NewControllerV2 called")
+
+	gatewayClasses := kclient.New[*k8sv1beta1.GatewayClass](kc)
+	gateways := kclient.NewFiltered[*k8sv1beta1.Gateway](kc, kclient.Filter{ObjectFilter: options.GetFilter()})
+	httpRoutes := kclient.NewFiltered[*k8sv1beta1.HTTPRoute](kc, kclient.Filter{ObjectFilter: options.GetFilter()})
 
 	c := &ControllerV2{
 		client:         kc,
-		gatewaysM:      make(map[types.NamespacedName]*k8sv1.Gateway),
+		gatewaysM:      make(map[types.NamespacedName]*k8sv1beta1.Gateway),
 		gatewayClasses: gatewayClasses,
 		gateways:       gateways,
 		httpRoutes:     httpRoutes,
@@ -94,16 +95,18 @@ func NewControllerV2(
 }
 
 func (c *ControllerV2) onHttpRouteEvent(event controllers.Event) {
+	logV2.Warnf("onHttpRouteEvent old: %+v, new: %+v", event.Old, event.New)
+
 	// TODO, think more about this.
 	// At this point, updates to HTTP routes trigger
 	// updates to the Gateway.
-	curHttpRoute := event.Latest().(*k8sv1.HTTPRoute)
+	curHttpRoute := event.Latest().(*k8sv1beta1.HTTPRoute)
 
 	// If curHttpRoute.Spec.ParentRefs contains a Gateway, we need to process it.
 	if curHttpRoute.Spec.ParentRefs != nil {
 		for _, ref := range curHttpRoute.Spec.ParentRefs {
 			logV2.Warnf("HTTPRoute %s/%s has parent ref %s/%s with kind %s", curHttpRoute.Namespace, curHttpRoute.Name, ref.Namespace, ref.Name, ref.Kind)
-			if ref.Kind == (*k8sv1.Kind)(&gvk.Gateway.Kind) {
+			if ref.Kind == (*k8sv1beta1.Kind)(&gvk.Gateway.Kind) {
 				gw := c.gateways.Get(string(ref.Name), string(*ref.Namespace))
 				if gw != nil {
 					c.queue.AddObject(gw)
@@ -166,7 +169,7 @@ func (c *ControllerV2) OnEvent(item types.NamespacedName) error {
 	return nil
 }
 
-func (c *ControllerV2) shouldProcessGatewayUpdate(gw *k8sv1.Gateway) bool {
+func (c *ControllerV2) shouldProcessGatewayUpdate(gw *k8sv1beta1.Gateway) bool {
 	className := string(gw.Spec.GatewayClassName)
 
 	// No gateway class found, this maybe meant for another controller, no action.
@@ -182,13 +185,14 @@ func (c *ControllerV2) shouldProcessGatewayUpdate(gw *k8sv1.Gateway) bool {
 }
 
 func (c *ControllerV2) List(typ config.GroupVersionKind, namespace string) []config.Config {
+	logV2.Warnf("List %s/%s", typ, namespace)
 	if typ != gvk.Gateway && typ != gvk.VirtualService {
 		return nil
 	}
 
 	out := make([]config.Config, 0)
 	gateways := c.gateways.List("", labels.Everything())
-	httpRoutes := c.httpRoutes.List("", labels.Everything())
+	// httpRoutes := c.httpRoutes.List("", labels.Everything())
 
 	for _, gw := range gateways {
 		processGw := c.shouldProcessGatewayUpdate(gw)
@@ -196,27 +200,29 @@ func (c *ControllerV2) List(typ config.GroupVersionKind, namespace string) []con
 			continue
 		}
 
-		switch typ {
-		case gvk.Gateway:
-			out = append(out, ConvertGatewayIstioGateway(gw, httpRoutes))
-		case gvk.VirtualService:
-			out = append(out, ConvertGatewayVirtualService(gw, httpRoutes))
-		}
+		// switch typ {
+		// case gvk.Gateway:
+		// 	out = append(out, ConvertGatewayIstioGateway(gw, httpRoutes))
+		// case gvk.VirtualService:
+		// 	out = append(out, ConvertGatewayVirtualService(gw, httpRoutes))
+		// }
 	}
 
 	return out
 }
 
-func ConvertGatewayVirtualService(gw *k8sv1.Gateway, httpRoutes []*k8sv1.HTTPRoute) config.Config {
-	return nil
-}
+// func ConvertGatewayVirtualService(gw *k8sv1.Gateway, httpRoutes []*k8sv1.HTTPRoute) config.Config {
+// 	return nil
+// }
 
-func ConvertGatewayIstioGateway(gw *k8sv1.Gateway, httpRoutes []*k8sv1.HTTPRoute) config.Config {
-	return nil
-}
+// func ConvertGatewayIstioGateway(gw *k8sv1.Gateway, httpRoutes []*k8sv1.HTTPRoute) config.Config {
+// 	return nil
+// }
 
 // RegisterEventHandler implements model.ConfigStoreController.
 func (c *ControllerV2) RegisterEventHandler(kind config.GroupVersionKind, f model.EventHandler) {
+	logV2.Warnf("RegisterEventHandler %s", kind)
+
 	switch kind {
 	case gvk.Gateway:
 		c.gatewayHandlers = append(c.gatewayHandlers, f)
@@ -226,13 +232,11 @@ func (c *ControllerV2) RegisterEventHandler(kind config.GroupVersionKind, f mode
 }
 
 func (c *ControllerV2) Run(stop <-chan struct{}) {
-	if features.EnableGatewayAPIGatewayClassControllerV2 {
-		if c.waitForCRD(gvr.GatewayClass, stop) {
-			c.client.RunAndWait(stop)
-			kube.WaitForCacheSync("gatewayV2", stop, c.gatewayClasses.HasSynced, c.gateways.HasSynced, c.httpRoutes.HasSynced)
-			c.queue.Run(stop)
-			controllers.ShutdownAll(c.gatewayClasses, c.gateways, c.httpRoutes)
-		}
+	if c.waitForCRD(gvr.GatewayClass, stop) {
+		c.client.RunAndWait(stop)
+		kube.WaitForCacheSync("gatewayV2", stop, c.gatewayClasses.HasSynced, c.gateways.HasSynced, c.httpRoutes.HasSynced)
+		c.queue.Run(stop)
+		controllers.ShutdownAll(c.gatewayClasses, c.gateways, c.httpRoutes)
 	}
 }
 

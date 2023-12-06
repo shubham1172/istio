@@ -111,6 +111,9 @@ func (s *Server) initConfigController(args *PilotArgs) error {
 				Run(stop)
 			return nil
 		})
+
+		s.ConfigStores = append(s.ConfigStores,
+			gateway.NewControllerV2(s.kubeClient, args.RegistryOptions.KubeOptions, s.kubeClient.CrdWatcher().WaitForCRD))
 	}
 
 	// Wrap the config controller with a cache.
